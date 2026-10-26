@@ -300,6 +300,13 @@ expect() {   # expect <ok text> <red text> <command...>: one pre-flight line
   local good=$1 bad=$2; shift 2
   if "$@" >/dev/null 2>&1; then ok "$good"; else red "$bad"; fi
 }
+pulls_from() {   # pulls_from <context> <Application> <path> <what>: one pre-flight line on the git source it pulls from; none when it is not there
+  local s d
+  s=$(app_source "$1" "$APP" "$2")
+  if [ -z "$s" ]; then return 0; fi
+  d=$(src_diff "$s" "$3")
+  if [ -z "$d" ]; then ok "$4 pulls $3 from $BRANCH on your origin"; else red "$4 pulls from $d: hack/build.sh re-applies it"; fi
+}
 
 cmd_check() {
   local a=${1:-$ACTIVE} p=${2:-$PASSIVE} c out newest rp="" rq=""
@@ -377,11 +384,12 @@ cmd_check() {
 
   if has_dr_role "$a" || has_dr_role "$p"; then
     sec_begin "Git-driven roles (Automated Pull Path P.2 and pre-flight)"
-    explain "Each hub's own Argo CD (the dr-role app) applies its role from dr/ in git. Both must be in sync with automation on, and dr-role must never be in a backup, or a restore would hand the other hub the wrong role."
+    explain "Each hub's own Argo CD (the dr-role app) applies its role from dr/ in git. Both must pull from $BRANCH on your origin, where the run's pull requests merge, and be in sync with automation on. dr-role must never be in a backup, or a restore would hand the other hub the wrong role."
     help_at docs/runbooks/dr-failover-pull-gitops/README.md#p1-bootstrap-each-hubs-dr-role-application
     for c in "$a" "$p"; do
       expect "$(cl "$c") dr-role Synced Healthy" "$(cl "$c") dr-role is '$(dr_role_state "$c")'" dr_role_synced "$c"
       expect "$(cl "$c") dr-role automation on" "$(cl "$c") dr-role automation is off (finish H.1)" dr_role_automated "$c"
+      pulls_from "$c" dr-role "dr/$c" "$(cl "$c") dr-role"
     done
     newest=$(oc --context "$a" get "$VBACKUP" -n "$NS" -o json 2>/dev/null | jq -r '
       [.items[] | select((.metadata.name | startswith("acm-resources-schedule-")) and .status.phase == "Completed")]
@@ -396,17 +404,18 @@ cmd_check() {
     else
       ok "backup $newest holds $(wc -l <<<"$out") Applications and no dr-role"
     fi
-    sec_end "dr-role synced and automated on both hubs, kept out of backups"
+    sec_end "dr-role synced and automated on both hubs, from $BRANCH, kept out of backups"
   fi
 
   sec_begin "Workload"
-  explain "The two demo apps on $(cl "$MANAGED"): the pull app, delivered by $(cl "$MANAGED")'s own Argo CD, and the push app, delivered by $(cl "$a")'s Argo CD. Both must answer and be in sync before the outage, or the probes prove nothing."
+  explain "The two demo apps on $(cl "$MANAGED"): the pull app, delivered by $(cl "$MANAGED")'s own Argo CD, and the push app, delivered by $(cl "$a")'s Argo CD. Both must answer and be in sync before the outage, or the probes prove nothing, and both must pull from $BRANCH on your origin, where the run pushes its mid-outage deploy."
   help_at docs/build.md#5-active-hub-gitops-wiring-and-the-demo-apps
   rp=$(revision "$APP_URL")
   expect "pull app answers 200 (serves $rp)" "pull app does not answer 200 (tried for 30 s)" wait_for 30 http_ok "$APP_URL"
   help_at docs/build.md#build-time-gotchas
   out=$(app_state "$MANAGED" "hello-failover-$MANAGED")
   if [ "$out" = "Synced Healthy" ]; then ok "pull app Synced Healthy on $(cl "$MANAGED")"; else red "pull app on $(cl "$MANAGED") is '$out'"; fi
+  pulls_from "$MANAGED" "hello-failover-$MANAGED" apps/hello-failover "pull app"
   if [ -n "$PUSH_APP_URL" ]; then
     help_at docs/build.md#5-active-hub-gitops-wiring-and-the-demo-apps
     rq=$(revision "$PUSH_APP_URL")
@@ -414,8 +423,9 @@ cmd_check() {
     help_at docs/build.md#build-time-gotchas
     out=$(app_state "$a" "hello-failover-push-$MANAGED")
     if [ "$out" = "Synced Healthy" ]; then ok "push app Synced Healthy on $(cl "$a")"; else red "push app on $(cl "$a") is '$out'"; fi
+    pulls_from "$a" "hello-failover-push-$MANAGED" apps/hello-failover-push "push app"
   fi
-  sec_end "pull app $rp${rq:+ and push app $rq} answer 200, Synced Healthy"
+  sec_end "pull app $rp${rq:+ and push app $rq} answer 200, Synced Healthy, from $BRANCH"
 
   HELP=""
   if [ "$BAD" = 0 ]; then
