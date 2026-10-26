@@ -17,6 +17,7 @@ BSCHED=backupschedules.cluster.open-cluster-management.io
 VSCHED=schedules.velero.io
 VBACKUP=backups.velero.io
 APP=applications.argoproj.io
+APPSET=applicationsets.argoproj.io
 
 # --- output ------------------------------------------------------------------
 # The screen gets gum's boxes and tables, and a spinner while the script waits.
@@ -564,6 +565,19 @@ http_ok() { [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1")" = 20
 app_state() {   # app_state <context> <Application name>: "Synced Healthy" when all is well
   oc --context "$1" get "$APP" -A --field-selector "metadata.name=$2" \
     -o jsonpath='{.items[0].status.sync.status} {.items[0].status.health.status}' 2>/dev/null || true
+}
+app_source() {   # app_source <context> <Application or ApplicationSet> <name>: "repoURL targetRevision path" it pulls from, empty when there is none
+  oc --context "$1" get "$2" -A --field-selector "metadata.name=$3" -o json 2>/dev/null |
+    jq -r '.items[0] // empty | (.spec.template.spec // .spec) | (.source // .sources[0] // empty) | select(.repoURL)
+      | "\(.repoURL | sub("\\.git$"; "") | sub("/$"; "")) \(.targetRevision // "-") \(.path // "-")"' || true
+}
+src_diff() {   # src_diff "<repoURL> <revision> <path>" <path>: how that source differs from <path> on $BRANCH of your origin; empty when it does not
+  local r b p o d=""
+  read -r r b p <<<"$1"
+  o=$(repo_url 2>/dev/null || true)
+  if [ "$r" != "${o%/}" ] || [ "$b" != "$BRANCH" ]; then d="${r#https://} @ $b, not $BRANCH on your origin"; fi
+  if [ "$p" != "$2" ]; then d+="${d:+; }$p, not $2"; fi
+  echo "$d"
 }
 has_dr_role() { some "$1" "$APP" dr-role -n "$GNS"; }
 dr_role_state() { oc --context "$1" get "$APP" dr-role -n "$GNS" -o jsonpath='{.status.sync.status} {.status.health.status}' 2>/dev/null || true; }

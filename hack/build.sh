@@ -423,7 +423,7 @@ co_unsettled() {   # co_unsettled < "oc get clusteroperators --no-headers": the 
     END {print b; print r}'
 }
 preflight() {
-  local c s v="" x t url origin rev
+  local c s v="" x t url origin rev k n w
   BAD=0
   stage "Pre-flight (read-only)" "Checks that the three clusters are healthy, that your copy of the repo is what the clusters will pull from, and what is installed already. It decides what the build installs and what it reuses, and refuses what would break: a hub that another hub manages, $(cl "$MANAGED") managed by some other hub, or two hubs on different ACM versions. Nothing changes in this stage."
 
@@ -450,7 +450,7 @@ preflight() {
   if [ "$BAD" = 1 ]; then HELP=""; verdict bad "BUILD RED: the clusters must be up and settled first"; return 1; fi
 
   sec_begin "Your copy of the repo"
-  explain "The demo apps and the dr-role applications pull from the repoURL and targetRevision in the manifests, so they must name your copy and the branch the settings file names. dr/ in git must give $(cl "$ACTIVE") the active role and $(cl "$PASSIVE") the passive one, as the settings file does: each hub's dr-role application applies exactly what git says."
+  explain "The demo apps and the dr-role applications pull from the repoURL and targetRevision in the manifests, so they must name your copy and the branch the settings file names. Ones already on the clusters that pull from elsewhere, from an earlier copy say, are re-applied from yours. dr/ in git must give $(cl "$ACTIVE") the active role and $(cl "$PASSIVE") the passive one, as the settings file does: each hub's dr-role application applies exactly what git says."
   help_at README.md#getting-started
   git fetch -q origin "$BRANCH" 2>/dev/null || true
   if git rev-parse -q --verify "origin/$BRANCH" >/dev/null; then ok "origin/$BRANCH exists"; else red "no branch $BRANCH on origin (BRANCH in $DR_ENV)"; fi
@@ -474,6 +474,17 @@ preflight() {
   else red "dr/$ACTIVE is $x on origin/$BRANCH, but the settings file makes $(cl "$ACTIVE") active (hack/teardown.sh --reset resets dr/)"; fi
   x=$(git_role "$PASSIVE")
   if [ "$x" = passive ]; then ok "dr/$PASSIVE is passive on origin/$BRANCH"; else red "dr/$PASSIVE is $x on origin/$BRANCH, but the settings file makes $(cl "$PASSIVE") passive (hack/teardown.sh --reset resets dr/)"; fi
+  # what the clusters pull from now: the build re-applies these from the manifests, so one that pulls from elsewhere is re-pointed
+  for x in "$ACTIVE $APPSET hello-failover apps/hello-failover pull app" "$ACTIVE $APPSET hello-failover-push apps/hello-failover-push push app" \
+    "$ACTIVE $APP dr-role dr/$ACTIVE dr-role" "$PASSIVE $APP dr-role dr/$PASSIVE dr-role"; do
+    read -r c k n t w <<<"$x"
+    s=$(app_source "$c" "$k" "$n")
+    if [ -n "$s" ]; then s=$(src_diff "$s" "$t"); fi
+    if [ -n "$s" ]; then
+      note "$(cl "$c")'s $w pulls from $s: the build re-applies it"
+      row "$(cl "$c")" "$w" "re-point it to $BRANCH on your origin"
+    fi
+  done
   sec_end "tracks $BRANCH on your origin; dr/ has $(cl "$ACTIVE") active, $(cl "$PASSIVE") passive"
 
   sec_begin "What is installed"

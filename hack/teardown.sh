@@ -64,7 +64,6 @@ done
 PV=acm-gitops-failover
 SUB=subscriptions.operators.coreos.com
 CSV=clusterserviceversions.operators.coreos.com
-APPSET=applicationsets.argoproj.io
 HUBS=("$ACTIVE" "$PASSIVE")
 CLUSTERS=("$ACTIVE" "$PASSIVE" "$MANAGED")
 # the build's marks on an ACM that was there before it (docs/build.md, "A hub that already runs ACM")

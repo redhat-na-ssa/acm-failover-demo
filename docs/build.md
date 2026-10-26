@@ -93,10 +93,13 @@ in between.
 - **A git host reachable from every cluster** (your copy of this repo):
   the spoke's local Argo CD pulls the apps from it, and each hub's local
   Argo CD reconciles its DR role (`dr/`) from it. The `hack/` scripts
-  work on your clone's `origin`: the pre-flight checks that `repoURL`
-  names it, and they push to the branch the settings file names (the
-  mid-outage deploy, the teardown's reset of `dr/`), so that branch must
-  accept pushes from your workstation.
+  work on your clone's `origin`: the build's pre-flight checks that
+  `repoURL` names it, and a build re-points the apps and `dr-role`
+  applications that pull from elsewhere (clusters built from an earlier
+  copy, say); `hack/dr.sh check` goes RED on any that do. The scripts push
+  to the branch the settings file names (the mid-outage deploy, the
+  teardown's reset of `dr/`), so that branch must accept pushes from your
+  workstation.
 - **The hubs never talk to each other.** Their only shared state is the
   bucket.
 - **Push delivery needs no extra ingress.** The hub's Argo CD reaches the
