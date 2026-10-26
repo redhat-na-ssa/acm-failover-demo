@@ -194,12 +194,22 @@ ask_settings() {   # ask_settings new|change: ask for the settings, from the fil
     if [ -z "$ca" ] || [ -f "${ca/#\~/$HOME}" ]; then break; fi
     note "no file at $ca"
   done
+  # the answers go to a copy, which replaces the settings file only once it is complete
+  local final
+  final=$(readlink -m "$DR_ENV")
+  mkdir -p "$(dirname "$final")"
+  DR_ENV=$(mktemp "$final.XXXXXX")
   if [ "$mode" = new ]; then
     # the build writes the demo apps' routes once they answer
     sed -e '/^# routes of the two demo apps/,/^$/d' -e 's/^# S3_URL=.*/S3_URL=/' "$REPO/hack/dr.env.example" >"$DR_ENV"
-    # the next run's number: after the runs whose logs are in ~/acm-dr/runs
-    n=$(find "$HOME/acm-dr/runs" -maxdepth 1 -name 'run-*' -printf '%f\n' 2>/dev/null | sed -n 's/^run-\([0-9][0-9]*\)$/\1/p' | sort -n | tail -n 1)
+    # the next run's number: after the runs whose logs are in ~/acm-dr/runs, which a first build has none of
+    n=""
+    if [ -d "$HOME/acm-dr/runs" ]; then
+      n=$(find "$HOME/acm-dr/runs" -maxdepth 1 -name 'run-*' -printf '%f\n' | sed -n 's/^run-\([0-9][0-9]*\)$/\1/p' | sort -n | tail -n 1)
+    fi
     set_setting RUN $((${n:-0} + 1))
+  else
+    cat "$final" >"$DR_ENV"
   fi
   set_setting KUBECONFIG "${kc/#$HOME/\~}"
   set_setting ACTIVE "$act"
@@ -211,6 +221,9 @@ ask_settings() {   # ask_settings new|change: ask for the settings, from the fil
   set_setting S3_PREFIX "$prefix"
   set_setting S3_REGION "$region"
   set_setting S3_CA_FILE "$ca"
+  chmod 644 "$DR_ENV"
+  mv "$DR_ENV" "$final"
+  DR_ENV=$final
   finished "${DR_ENV/#$HOME/\~}, saved:"
 }
 stage_settings() {   # on a terminal, the first stage: write the settings file, or show it and keep or change it
