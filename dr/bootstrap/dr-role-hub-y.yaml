@@ -1,0 +1,28 @@
+# Bootstrap: apply ONCE, MANUALLY, on hub-y only — AFTER dr-role-rbac.yaml:
+#   oc --context hub-y apply -f dr/bootstrap/dr-role-rbac.yaml
+#   oc --context hub-y apply -f dr/bootstrap/dr-role-hub-y.yaml
+# See dr-role-hub-x.yaml for the full rationale (imperative bootstrap,
+# RBAC-first ordering, exclude-from-backup criticality, PruneFirst).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dr-role
+  namespace: openshift-gitops
+  labels:
+    app.kubernetes.io/part-of: acm-gitops-failover
+    velero.io/exclude-from-backup: "true"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/redhat-na-ssa/acm-failover-demo
+    targetRevision: main
+    path: dr/hub-y
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: open-cluster-management-backup
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - PruneFirst=true

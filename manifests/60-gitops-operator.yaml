@@ -1,0 +1,17 @@
+# OpenShift GitOps operator — required on ALL THREE clusters: both hubs
+# (the restore hub must carry the same operators as the backup hub) and
+# the spoke (its local Argo CD does the pull-model sync). Channel latest
+# (verified with 1.21).
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-gitops-operator
+  namespace: openshift-operators
+  labels:
+    app.kubernetes.io/part-of: acm-gitops-failover
+spec:
+  channel: latest
+  installPlanApproval: Automatic
+  name: openshift-gitops-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

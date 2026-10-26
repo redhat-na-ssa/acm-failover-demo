@@ -1,0 +1,345 @@
+# Automated Pull Path — DR exercise runbook: GitOps operation, pull delivery
+
+Same command / rationale / success / failure format as the
+verified [Manual Pull Path runbook](../dr-failover-pull-manual/README.md); this
+document is a DELTA — phases not listed here run exactly as the Manual
+Pull Path wrote them. How the git-driven roles work, and why failover
+takes two PRs, is [dr/README.md](../../../dr/README.md); measured timings
+are in [results.md](../../results.md).
+
+Conventions as the Manual Pull Path (`$ACTIVE`/`$PASSIVE`/`$MANAGED`,
+`$ACTIVE_API`, UTC, probes), plus each hub's overlay directory, which is
+named after the hub's context:
+
+```bash
+export ACTIVE_DIR=dr/$ACTIVE
+export PASSIVE_DIR=dr/$PASSIVE
+export BRANCH=main   # the branch the dr-role apps track (targetRevision in dr/bootstrap); PRs target it
+```
+
+With [`hack/dr.sh`](../../../hack/dr.sh) (setup in the
+[Manual Pull Path](../dr-failover-pull-manual/README.md#running-it-with-hackdrsh)),
+`hack/dr.sh run --git` runs this path. It authors PR-A, PR-B and the
+demote PR, opens each one with `gh` when that is signed in (otherwise
+it prints the compare link and the PR text), and waits for your merge
+to land on `$BRANCH` before the next step. Phase P stays a one-time
+manual setup.
+
+## Phase P — One-time prerequisites
+
+(P runs once per HUB, not per role — `hub-x`/`hub-y` below are cluster
+identities, not the `$ACTIVE`/`$PASSIVE` of any particular exercise.)
+
+### P.0 RBAC first — the grant that makes git-driven DR possible
+
+```bash
+for hub in hub-x hub-y; do
+  oc --context $hub apply -f dr/bootstrap/dr-role-rbac.yaml
+  oc --context $hub auth can-i patch backupschedules.cluster.open-cluster-management.io \
+    -n open-cluster-management-backup \
+    --as=system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller
+done
+```
+
+**Why:** Discovered live: the default openshift-gitops
+application-controller CANNOT write ACM backup CRs, and the operator's
+`managed-by` label does NOT fix it (its minted role is an API-group
+allowlist omitting `cluster.open-cluster-management.io` — verified with
+`auth can-i` after labeling). The explicit Role grants exactly two
+resource types in exactly one namespace — the fix and the security
+statement in one file.
+
+**Success:** `yes` from `auth can-i` on both hubs.
+
+**Failure:** `no` → the RoleBinding subject doesn't match your Argo
+instance's controller SA; check the SA name in the error message of a
+failed sync and align.
+
+### P.1 Bootstrap each hub's dr-role Application
+
+```bash
+ts() {   # creationTimestamp of each hub's role object, before and after
+  oc --context hub-x get backupschedule schedule-acm -n open-cluster-management-backup \
+    -o jsonpath='hub-x BackupSchedule {.metadata.creationTimestamp}{"\n"}'
+  oc --context hub-y get restores.cluster.open-cluster-management.io restore-acm-passive-sync \
+    -n open-cluster-management-backup -o jsonpath='hub-y Restore {.metadata.creationTimestamp}{"\n"}'
+}
+ts
+oc --context hub-x apply -f dr/bootstrap/dr-role-hub-x.yaml
+oc --context hub-y apply -f dr/bootstrap/dr-role-hub-y.yaml
+for hub in hub-x hub-y; do
+  oc --context $hub wait applications.argoproj.io/dr-role -n openshift-gitops \
+    --for=jsonpath='{.status.operationState.phase}'=Succeeded --timeout=10m
+  oc --context $hub get applications.argoproj.io dr-role -n openshift-gitops
+done
+ts
+```
+
+**Why:** Each hub's own Argo must reconcile its own role — the applier of
+a failover cannot be the hub that just died. Imperative once, declarative
+forever after. (`applications.argoproj.io`, never bare `application` —
+ACM's CRD shadows it; yes, this bit us again during verification.)
+
+**Success:** Both `Synced | Healthy`, and ADOPTION not
+recreation — the live BackupSchedule (hub-x) and passive Restore (hub-y)
+kept their original creationTimestamps through the first sync.
+
+**Failure:** Sync `Failed` on RBAC → P.0 was skipped or landed late.
+NOTE (observed live): a sync that exhausts its retries stays `Failed` —
+Argo will NOT re-attempt the same revision by itself even with selfHeal.
+After fixing the cause, trigger a fresh operation:
+
+```bash
+oc --context <hub> patch applications.argoproj.io dr-role -n openshift-gitops \
+  --type merge -p '{"operation":{"sync":{}}}'
+```
+
+`OutOfSync` with a spec diff on adoption → the live object drifted from
+`manifests/` (the copies are supposed to be identical); reconcile the
+drift BEFORE trusting git-driven ops.
+
+### P.2 Confirm the backup exclusion works
+
+```bash
+NEWEST=$(oc --context $ACTIVE get backup -n open-cluster-management-backup \
+  --sort-by=.status.startTimestamp -o name | grep acm-resources-schedule | tail -1 | cut -d/ -f2)
+oc --context $ACTIVE -n open-cluster-management-backup exec deploy/velero -- \
+  /velero backup describe "$NEWEST" --details | grep -A12 'v1alpha1/Application'
+```
+
+**Why:** If `dr-role` ever lands in a backup, a future restore delivers
+split-brain (the other hub reconciling the wrong role dir). Exec'ing the
+velero pod avoids needing a local CLI.
+
+**Success:** the instance list shows the delivery resources
+(the `hello-failover-$MANAGED` and `hello-failover-push-$MANAGED`
+Applications, both ApplicationSets, the ArgoCD CR) and NO `dr-role`
+— which existed in that namespace at backup time. Precision exclusion,
+proven instance-level.
+
+**Failure:** `dr-role` appears → stop; fix the label before anything
+else.
+
+## Phase 0/A/B/C — as the Manual Pull Path, plus one pre-flight line
+
+Run the Manual Pull Path's Phases 0, A, B, C unchanged (MSA check, probes, out-of-band or
+`oc debug` kill, death gate, mid-outage v-next push — pull delivery still
+works hubless; that claim is already verified). Add to pre-flight:
+
+```bash
+oc --context $PASSIVE get applications.argoproj.io dr-role -n openshift-gitops -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+```
+
+**Why:** The survivor's reconciler is about to become the failover's
+executor; a broken dr-role app discovered mid-outage is a failed exercise.
+
+**Success:** `Synced Healthy`.
+
+## Phase D' — Failover as a pull request (PR-A: activation ONLY)
+
+**FINDING (found live): the one-PR flip straight to
+`../roles/active` is FALSIFIED.** The role's BackupSchedule lands in the
+same sync as the activation Restore; the operator ignores the Restore
+while any schedule is active ("This resource is ignored because
+BackupSchedule resource schedule-acm is currently active"), and the
+premature schedule then overwrites the bucket's `latest` with the
+survivor's passive (empty-fleet) state — after which even a re-run
+activation "succeeds" restoring nothing. Recovery cost a full revert PR
+and a bucket heal. Failover is therefore TWO PRs: D' (activation) and
+F' (promotion).
+
+### D'.1 Author the activation PR
+
+```bash
+STAMP=$(date -u +%Y%m%d%H%M)
+git checkout $BRANCH && git pull --ff-only
+git checkout -b failover-$STAMP
+cp dr/templates/restore-activate.template.yaml "$PASSIVE_DIR/restore-activate-$STAMP.yaml"
+sed -i "s/<UTCSTAMP>/$STAMP/" "$PASSIVE_DIR/restore-activate-$STAMP.yaml"
+# resources lists ONLY the new file: ../roles/passive goes, and ../roles/active
+# is NOT added (that is F''s promotion PR, after the claim lands)
+sed -i "s#^  - ../roles/passive\$#  - restore-activate-$STAMP.yaml#" "$PASSIVE_DIR/kustomization.yaml"
+grep '^  - ' "$PASSIVE_DIR/kustomization.yaml"   # expect: only restore-activate-$STAMP.yaml
+git add dr/ && git commit -m "FAILOVER: activate $PASSIVE ($ACTIVE dead $(date -u +%FT%TZ))" && git push -u origin HEAD
+# open the PR against $BRANCH
+```
+
+**Why:** The change is the entire failover *decision*, reviewable as a
+diff: drop the passive role, add one uniquely-named activation one-shot
+(the G.5 lesson baked into the filename). Nothing else — no
+BackupSchedule until the fleet is claimed. The dead hub's overlay is NOT
+touched yet — demotion is a separate, later decision, exactly as in the
+manual path.
+
+**Success:** PR shows a two-file diff whose kustomization lists exactly
+one resource:
+
+```bash
+git diff --stat origin/$BRANCH...HEAD   # expect: exactly the two files under $PASSIVE_DIR
+```
+
+**Failure:** `../roles/active` in the diff → you are re-running the
+falsified one-PR choreography; fix before merge.
+
+### D'.2 Review = the split-brain gate; merge = the decision
+
+```bash
+curl -sk --max-time 5 $ACTIVE_API/version || echo DEAD   # reviewer runs this
+```
+
+**Why:** The manual path's death check (B.1) moves into the merge decision — the
+reviewer verifies death, and the merge commit records who decided, when,
+on what evidence. (CI running this same check as a required status turns
+the guard into machinery; note it as an enhancement, don't block on it.)
+
+**Success:** `DEAD` → merge.
+
+**Failure:** JSON answer → the active hub LIVES; close the PR. Merging
+here is the split-brain the Manual Pull Path warns about, with better bookkeeping.
+
+### D'.3 Let the survivor execute, and cut the poll wait
+
+```bash
+oc --context $PASSIVE annotate applications.argoproj.io dr-role -n openshift-gitops argocd.argoproj.io/refresh=normal --overwrite
+until oc --context $PASSIVE get restore restore-acm-activate-$STAMP -n open-cluster-management-backup \
+  -o jsonpath='{.status.phase}' 2>/dev/null | grep -q '^Finished'; do sleep 5; done
+oc --context $PASSIVE get restore -n open-cluster-management-backup   # $STAMP from D'.1
+```
+
+**Why:** Argo's ≤3 min poll is the only new latency vs the manual path;
+the refresh annotation cuts merge-to-sync to seconds. PruneFirst should
+remove the passive Restore before the activation applies (WATCH for this:
+the passive restore should disappear, then the activation appear and run
+to `Finished`).
+
+**Success:** Passive restore pruned, `restore-acm-activate-<stamp>`
+reaches `Finished`, then `$MANAGED` lands `Joined/Available` on
+`$PASSIVE` (same ≈10 s machinery as verified).
+
+**Failure (treat as the expected first outcome):** the activation lands
+`FinishedWithErrors` with lastMessage
+"ignored because Restore resource restore-acm-passive-sync is currently
+active" — PruneFirst prunes the passive restore, but the operator
+evaluates the activation before the prune completes, and a Restore is
+one-shot: it stays dead. **Recovery (~30 s):** delete the ignored
+activation Restore; selfHeal re-creates it within ~6 s and the fresh
+object runs clean:
+
+```bash
+oc --context $PASSIVE delete restore restore-acm-activate-$STAMP -n open-cluster-management-backup
+sleep 15   # selfHeal re-creates the one-shot in seconds; expect it to reach Finished
+until oc --context $PASSIVE get restore restore-acm-activate-$STAMP -n open-cluster-management-backup \
+  -o jsonpath='{.status.phase}' 2>/dev/null | grep -q '^Finished'; do sleep 5; done
+oc --context $PASSIVE get restore -n open-cluster-management-backup
+```
+
+Do NOT touch the passive restore (already pruned) and do NOT
+`oc apply` the manifest by hand (a hand-applied object is untracked and
+the demote PR's prune will never clean it — learned live).
+
+## Phase E — as the Manual Pull Path
+
+Manual Pull Path E (verify + [MSA hygiene](../../msa-token-hygiene.md)) unchanged.
+
+## Phase F' — Promotion PR (PR-B): the git-driven F.1
+
+```bash
+git checkout $BRANCH && git pull --ff-only   # PR-A merged
+git checkout -b promote-$(date -u +%Y%m%d%H%M)
+# resources -> ../roles/active plus the one-shot (keep it; the demote PR removes it)
+sed -i "s#^  - restore-activate-$STAMP.yaml\$#  - ../roles/active\n  - restore-activate-$STAMP.yaml#" "$PASSIVE_DIR/kustomization.yaml"
+grep '^  - ' "$PASSIVE_DIR/kustomization.yaml"   # expect: ../roles/active and restore-activate-$STAMP.yaml
+git add dr/ && git commit -m "PROMOTE: $PASSIVE to full active (claim verified)" && git push -u origin HEAD
+# open the PR against $BRANCH — review gate: $MANAGED Joined/Available on $PASSIVE (paste it); merge, then:
+oc --context $PASSIVE annotate applications.argoproj.io dr-role -n openshift-gitops argocd.argoproj.io/refresh=normal --overwrite
+```
+
+**Why:** Delivers the BackupSchedule only AFTER the claim landed — the
+same ordering the manual path enforces with F.1, expressed in git. The
+review gate is posture evidence, not death evidence.
+
+**Success:** After merge+sync: schedule `Enabled`, the first full set
+fires immediately and reaches `Completed` within ~1 min; no
+`BackupCollision` (the old hub is dead or already demoted).
+
+```bash
+oc --context $PASSIVE get backupschedule,backup -n open-cluster-management-backup | head
+# expect: schedule-acm Enabled; a full backup set Completed shortly after merge
+```
+
+**Failure:** Restore refused/ignored messages at THIS point → you merged
+F' before D''s restore `Finished`; the operator's one-at-a-time rule
+also applies to schedule-vs-restore — wait, then re-sync. F.2 unchanged
+from the Manual Pull Path.
+
+## Phase G' — Demote as the mirror PR
+
+### G'.1 Author + merge the demote PR (dead hub still off is fine)
+
+```bash
+git checkout $BRANCH && git pull --ff-only
+git checkout -b demote-$(date -u +%Y%m%d%H%M)
+# resources -> ../roles/passive; drop any one-shot (the prune then reaps the Finished restore)
+sed -i 's#^  - ../roles/active$#  - ../roles/passive#; /^  - restore-activate-.*\.yaml$/d' "$ACTIVE_DIR/kustomization.yaml"
+git rm -q --ignore-unmatch "$ACTIVE_DIR"/restore-activate-*.yaml
+grep '^  - ' "$ACTIVE_DIR/kustomization.yaml"   # expect: only ../roles/passive
+git add -A dr/ && git commit -m "DEMOTE: $ACTIVE to passive" && git push -u origin HEAD
+# open the PR against $BRANCH — review gate here is posture correctness, not death; merge
+```
+
+**Why:** Merging while the hub is down means it boots into current truth:
+its Argo prunes the stale BackupSchedule (automating manual G.2) and
+applies the passive Restore (manual G.4). The boot-time race between the
+`BackupCollision` freeze and the prune was observed both ways, benign
+each time.
+
+**Success:** After the hub boots: `dr-role` `Synced`, exactly one restore
+(`restore-acm-passive-sync` `Enabled`), no BackupSchedule.
+
+```bash
+oc --context $ACTIVE get applications.argoproj.io dr-role -n openshift-gitops \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'   # expect: Synced Healthy
+oc --context $ACTIVE get restore,backupschedule -n open-cluster-management-backup
+# expect: restore-acm-passive-sync Enabled and NO BackupSchedule
+oc --context $ACTIVE get schedules.velero.io -n open-cluster-management-backup   # expect: No resources found
+oc --context $PASSIVE get backupschedule -n open-cluster-management-backup        # the new active hub: expect Enabled
+```
+
+The pruned BackupSchedule's Velero schedules can outlive it for a few
+minutes after a boot (Manual Pull Path G.2); delete any that remain
+with `oc --context $ACTIVE delete schedules.velero.io -n
+open-cluster-management-backup --all`.
+
+**Failure:** Sync stuck on the pruned schedule → delete it by hand; the underlying BackupCollision guard has already frozen it
+regardless (verified in the Manual Pull Path, both directions).
+If the demoted hub's LAST activation was MANUAL, its fixed-name
+`restore-acm-activate` is NOT Argo-tracked and this prune will never
+remove it — delete it by hand now (verified live; same mechanism as the
+hand-apply warning in D'.3), or the next manual activation on this hub
+silently no-ops:
+
+```bash
+oc --context $ACTIVE delete restores.cluster.open-cluster-management.io restore-acm-activate \
+  -n open-cluster-management-backup --ignore-not-found
+```
+
+### G'.2 The imperative residue — exactly as Manual Pull Path G.1 + G.3
+
+Wait for `$MANAGED` to read `Available: Unknown` on the returned hub
+(Manual Pull Path G.1's gate, including its warning — this is still the one
+dangerous moment), then delete the stale ManagedCluster (G.3). No PR
+represents this: it is runtime state, and the gate is a live reading.
+
+```bash
+until curl -sk --max-time 5 $ACTIVE_API/version >/dev/null; do sleep 15; done   # the returned hub's API
+oc --context $ACTIVE wait managedcluster/$MANAGED \
+  --for=condition=ManagedClusterConditionAvailable=Unknown --timeout=15m
+oc --context $ACTIVE get managedclusters        # gate: $MANAGED reads Available=Unknown
+oc --context $ACTIVE delete managedcluster $MANAGED
+```
+
+## Phase H — evidence
+
+As the Manual Pull Path's Phase H. Also confirm `hack/validate.py` (CI)
+reports the posture you expect: after the demote PR, exactly one hub
+`active` and the other `passive`.

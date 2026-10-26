@@ -1,0 +1,41 @@
+# ACM operator install — apply on BOTH hubs (hub-x and hub-y).
+# SKIP this file on a cluster that already runs ACM: OLM allows one
+# OperatorGroup per namespace, and adding this one next to an existing one
+# fails every CSV in the namespace (TooManyOperatorGroups). Check first:
+#   oc get operatorgroup -n open-cluster-management
+# Both hubs must run the SAME ACM version: a backup cannot be restored on a
+# hub running an older version than the hub that wrote it. With
+# installPlanApproval: Automatic the hubs can drift apart by a z-stream
+# (e.g. while one is down); in production prefer Manual approval and
+# upgrade both hubs together.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: open-cluster-management
+  labels:
+    app.kubernetes.io/part-of: acm-gitops-failover
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: open-cluster-management
+  namespace: open-cluster-management
+  labels:
+    app.kubernetes.io/part-of: acm-gitops-failover
+spec:
+  targetNamespaces:
+    - open-cluster-management
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+  labels:
+    app.kubernetes.io/part-of: acm-gitops-failover
+spec:
+  channel: release-2.17
+  installPlanApproval: Automatic
+  name: advanced-cluster-management
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
